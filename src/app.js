@@ -1,5 +1,5 @@
 const express = require('express');
-const { randomUUID } = require('crypto');
+const { randomUUID, createHash } = require('crypto');
 const { db } = require('./db');
 const {
   nowIso,
@@ -53,10 +53,16 @@ function getSheet(sessionId) {
   };
 }
 
-function requireSelectedSession(res) {
-  const sessionId = getSelectedSessionId();
+function requireSelectedSession(res, providedSessionId) {
+  const sessionId = providedSessionId || getSelectedSessionId();
   if (!sessionId) {
-    res.status(404).json({ error: 'No selected session. Call POST /session/select first.' });
+    res.status(400).json({ error: 'sessionId is required in request body or must have a selected session.' });
+    return null;
+  }
+  // Verify the session exists
+  const existing = db.prepare('SELECT session_id FROM sessions WHERE session_id = ?').get(sessionId);
+  if (!existing) {
+    res.status(404).json({ error: 'Session not found.' });
     return null;
   }
   return sessionId;
@@ -243,7 +249,7 @@ app.get('/sheet/summary', (_req, res) => {
 });
 
 app.post('/perk/roll', (req, res) => {
-  const sessionId = requireSelectedSession(res);
+  const sessionId = requireSelectedSession(res, req.body?.sessionId);
   if (!sessionId) return;
   const tier = Number.isInteger(req.body?.tier) ? req.body.tier : null;
 
@@ -253,7 +259,23 @@ app.post('/perk/roll', (req, res) => {
   const filtered = all.filter((p) => (tier ? p.tier === tier : true) && !owned.includes(p.id));
   if (filtered.length === 0) return res.status(404).json({ error: 'No available perks to roll.' });
 
-  const pick = filtered[Math.floor(Math.random() * filtered.length)];
+  // Get or initialize roll counter for deterministic selection
+  const sheet = db.prepare('SELECT resources_json FROM character_sheets WHERE session_id = ?').get(sessionId);
+  const resources = parseJson(sheet?.resources_json, defaultResources());
+  const rollCounter = resources.__rollCounter || 0;
+
+  // Deterministic hash-based selection
+  const hash = createHash('sha256').update(sessionId + rollCounter).digest('hex');
+  const index = parseInt(hash.substring(0, 8), 16) % filtered.length;
+  const pick = filtered[index];
+
+  // Increment and persist roll counter
+  resources.__rollCounter = rollCounter + 1;
+  db.prepare('UPDATE character_sheets SET resources_json = ? WHERE session_id = ?').run(
+    JSON.stringify(resources),
+    sessionId
+  );
+
   res.json({
     perk: {
       id: pick.id,
@@ -269,7 +291,7 @@ app.post('/perk/roll', (req, res) => {
 });
 
 app.post('/perk/buy', (req, res) => {
-  const sessionId = requireSelectedSession(res);
+  const sessionId = requireSelectedSession(res, req.body?.sessionId);
   if (!sessionId) return;
   const { perkId } = req.body || {};
   if (typeof perkId !== 'string') return badRequest(res, 'perkId is required.');
@@ -312,10 +334,11 @@ app.get('/perk/:id', (req, res) => {
 });
 
 app.post('/xp/add', (req, res) => {
-  const sessionId = requireSelectedSession(res);
+  const sessionId = requireSelectedSession(res, req.body?.sessionId);
   if (!sessionId) return;
   const { perkId, amount } = req.body || {};
   if (typeof perkId !== 'string' || typeof amount !== 'number') return badRequest(res, 'perkId and numeric amount are required.');
+  if (!Number.isFinite(amount) || amount < 0) return badRequest(res, 'amount must be a finite non-negative number.');
 
   const owned = db.prepare('SELECT * FROM perk_instances WHERE session_id = ? AND perk_id = ?').get(sessionId, perkId);
   if (!owned) return res.status(404).json({ error: 'Perk instance not found.' });
@@ -331,12 +354,13 @@ app.post('/xp/add', (req, res) => {
 });
 
 app.post('/resource/modify', (req, res) => {
-  const sessionId = requireSelectedSession(res);
+  const sessionId = requireSelectedSession(res, req.body?.sessionId);
   if (!sessionId) return;
   const { resource, amount, reason } = req.body || {};
   if (typeof resource !== 'string' || typeof amount !== 'number') {
     return badRequest(res, 'resource and numeric amount are required.');
   }
+  if (!Number.isFinite(amount)) return badRequest(res, 'amount must be a finite number.');
 
   const sheet = getSheet(sessionId);
   const oldValue = sheet.resources?.[resource]?.current || 0;
@@ -355,12 +379,13 @@ app.post('/resource/modify', (req, res) => {
 });
 
 app.post('/resource/set', (req, res) => {
-  const sessionId = requireSelectedSession(res);
+  const sessionId = requireSelectedSession(res, req.body?.sessionId);
   if (!sessionId) return;
   const { resource, value, reason } = req.body || {};
   if (typeof resource !== 'string' || typeof value !== 'number') {
     return badRequest(res, 'resource and numeric value are required.');
   }
+  if (!Number.isFinite(value) || value < 0) return badRequest(res, 'value must be a finite non-negative number.');
 
   const sheet = getSheet(sessionId);
   const oldValue = sheet.resources?.[resource]?.current || 0;
@@ -384,9 +409,13 @@ app.post('/perk/generate', (req, res) => {
   if (typeof theme !== 'string' || typeof tier !== 'number' || typeof constellation !== 'string') {
     return badRequest(res, 'theme, tier, and constellation are required.');
   }
+  if (!Number.isInteger(tier) || !Number.isFinite(tier) || tier <= 0) {
+    return badRequest(res, 'tier must be a positive integer.');
+  }
 
   const normalized = theme.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
-  const id = `${normalized}_${Date.now()}`;
+  const base = normalized || 'perk';
+  const id = `${base}_${randomUUID()}`;
   const perk = {
     id,
     name: `${theme} Attunement`,
@@ -419,7 +448,7 @@ app.post('/perk/generate', (req, res) => {
 });
 
 app.post('/turn/finalize', (req, res) => {
-  const sessionId = requireSelectedSession(res);
+  const sessionId = requireSelectedSession(res, req.body?.sessionId);
   if (!sessionId) return;
 
   const sheet = getSheet(sessionId);
@@ -452,8 +481,11 @@ app.post('/turn/finalize', (req, res) => {
   }
 
   const xpGains = Array.isArray(req.body?.xpGains) ? req.body.xpGains : [];
+  const xpUpdates = [];
+
   for (const gain of xpGains) {
     if (!gain || typeof gain.perkId !== 'string' || typeof gain.amount !== 'number') continue;
+    if (!Number.isFinite(gain.amount) || gain.amount < 0) continue;
     const ownedPerk = db
       .prepare('SELECT * FROM perk_instances WHERE session_id = ? AND perk_id = ?')
       .get(sessionId, gain.perkId);
@@ -461,8 +493,8 @@ app.post('/turn/finalize', (req, res) => {
     if (!ownedPerk || !def) continue;
 
     const result = applyXp({ scaling: parseJson(def.scaling_json, { type: 'none' }) }, { level: ownedPerk.level, xp: ownedPerk.xp }, gain.amount);
-    db.prepare('UPDATE perk_instances SET level = ?, xp = ? WHERE id = ?').run(result.level, result.xp, ownedPerk.id);
 
+    xpUpdates.push({ ownedPerkId: ownedPerk.id, level: result.level, xp: result.xp });
     updates.push(`+${gain.amount} XP (${def.name})`);
     for (const lvl of result.leveledTo) {
       updates.push(`${def.name} leveled up to ${lvl}`);
@@ -470,13 +502,31 @@ app.post('/turn/finalize', (req, res) => {
   }
 
   const newTurn = sheet.turn + 1;
-  db.prepare('UPDATE character_sheets SET resources_json = ?, turn = ? WHERE session_id = ?').run(
-    JSON.stringify(resources),
-    newTurn,
-    sessionId
-  );
 
-  appendLog(sessionId, 'turn_finalize', { turn: newTurn, updates });
+  // Execute all DB writes in a single transaction
+  const tx = db.transaction(() => {
+    // Update perk XP
+    const updatePerkStmt = db.prepare('UPDATE perk_instances SET level = ?, xp = ? WHERE id = ?');
+    for (const update of xpUpdates) {
+      updatePerkStmt.run(update.level, update.xp, update.ownedPerkId);
+    }
+
+    // Update character sheet
+    db.prepare('UPDATE character_sheets SET resources_json = ?, turn = ? WHERE session_id = ?').run(
+      JSON.stringify(resources),
+      newTurn,
+      sessionId
+    );
+
+    // Log the finalization
+    appendLog(sessionId, 'turn_finalize', { turn: newTurn, updates });
+  });
+
+  try {
+    tx();
+  } catch (err) {
+    return badRequest(res, `Failed to finalize turn: ${err.message}`);
+  }
 
   res.json({ turn: newTurn, updates });
 });

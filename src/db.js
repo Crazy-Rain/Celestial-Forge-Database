@@ -9,6 +9,7 @@ if (!fs.existsSync(dataDir)) {
 
 const db = new Database(path.join(dataDir, 'celestial_forge.sqlite'));
 db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS sessions (
