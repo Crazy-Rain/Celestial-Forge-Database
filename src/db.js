@@ -8,15 +8,14 @@ if (!fs.existsSync(dataDir)) {
 }
 
 const db = new Database(path.join(dataDir, 'celestial_forge.sqlite'));
-db.pragma('foreign_keys = ON');
 db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS sessions (
   session_id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  roll_counter INTEGER NOT NULL DEFAULT 0
+  created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS app_state (
@@ -68,10 +67,5 @@ CREATE TABLE IF NOT EXISTS logs (
   FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 `);
-
-const sessionColumns = db.prepare('PRAGMA table_info(sessions)').all();
-if (!sessionColumns.some((column) => column.name === 'roll_counter')) {
-  db.exec('ALTER TABLE sessions ADD COLUMN roll_counter INTEGER NOT NULL DEFAULT 0');
-}
 
 module.exports = { db };

@@ -1,5 +1,5 @@
 const express = require('express');
-const { randomUUID } = require('crypto');
+const { randomUUID, createHash } = require('crypto');
 const { db } = require('./db');
 const {
   nowIso,
@@ -53,32 +53,19 @@ function getSheet(sessionId) {
   };
 }
 
-function getSessionById(sessionId) {
-  return db.prepare('SELECT session_id, name, created_at, roll_counter FROM sessions WHERE session_id = ?').get(sessionId);
-}
-
-function requireSelectedSession(req, res, { allowImplicit = false } = {}) {
-  const explicitId = req.body?.sessionId || req.query?.sessionId;
-  const sessionId = typeof explicitId === 'string' && explicitId.trim().length > 0 ? explicitId.trim() : null;
-
-  if (!sessionId && !allowImplicit) {
-    res.status(400).json({ error: 'sessionId is required.' });
+function requireSelectedSession(res, providedSessionId) {
+  const sessionId = providedSessionId || getSelectedSessionId();
+  if (!sessionId) {
+    res.status(400).json({ error: 'sessionId is required in request body or must have a selected session.' });
     return null;
   }
-
-  const finalSessionId = sessionId || getSelectedSessionId();
-  if (!finalSessionId) {
-    res.status(404).json({ error: 'No selected session. Call POST /session/select first.' });
-    return null;
-  }
-
-  const existing = getSessionById(finalSessionId);
+  // Verify the session exists
+  const existing = db.prepare('SELECT session_id FROM sessions WHERE session_id = ?').get(sessionId);
   if (!existing) {
     res.status(404).json({ error: 'Session not found.' });
     return null;
   }
-
-  return finalSessionId;
+  return sessionId;
 }
 
 function appendLog(sessionId, type, payload) {
@@ -88,15 +75,6 @@ function appendLog(sessionId, type, payload) {
     JSON.stringify(payload),
     nowIso()
   );
-}
-
-function deterministicHash(input) {
-  let hash = 2166136261;
-  for (let i = 0; i < input.length; i += 1) {
-    hash ^= input.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  return hash >>> 0;
 }
 
 function seedPerksIfEmpty() {
@@ -241,7 +219,7 @@ app.post('/session/duplicate', (req, res) => {
 });
 
 app.get('/sheet/full', (_req, res) => {
-  const sessionId = requireSelectedSession(_req, res, { allowImplicit: true });
+  const sessionId = requireSelectedSession(res);
   if (!sessionId) return;
   const sheet = getSheet(sessionId);
   if (!sheet) return res.status(404).json({ error: 'Character sheet not found.' });
@@ -249,7 +227,7 @@ app.get('/sheet/full', (_req, res) => {
 });
 
 app.get('/sheet/summary', (_req, res) => {
-  const sessionId = requireSelectedSession(_req, res, { allowImplicit: true });
+  const sessionId = requireSelectedSession(res);
   if (!sessionId) return;
   const sheet = getSheet(sessionId);
   if (!sheet) return res.status(404).json({ error: 'Character sheet not found.' });
@@ -271,25 +249,32 @@ app.get('/sheet/summary', (_req, res) => {
 });
 
 app.post('/perk/roll', (req, res) => {
-  const sessionId = requireSelectedSession(req, res);
+  const sessionId = requireSelectedSession(res, req.body?.sessionId);
   if (!sessionId) return;
-  const tierRaw = req.body?.tier;
-  const tier = tierRaw === undefined ? null : Number(tierRaw);
-  if (tier !== null && (!Number.isInteger(tier) || tier < 1)) {
-    return badRequest(res, 'tier must be a positive integer when provided.');
-  }
+  const tier = Number.isInteger(req.body?.tier) ? req.body.tier : null;
 
   const owned = db.prepare('SELECT perk_id FROM perk_instances WHERE session_id = ?').all(sessionId).map((r) => r.perk_id);
-  const all = db.prepare('SELECT * FROM perks ORDER BY id ASC').all();
+  const all = db.prepare('SELECT * FROM perks').all();
 
   const filtered = all.filter((p) => (tier ? p.tier === tier : true) && !owned.includes(p.id));
   if (filtered.length === 0) return res.status(404).json({ error: 'No available perks to roll.' });
 
-  const session = getSessionById(sessionId);
-  const currentCounter = Number.isInteger(session?.roll_counter) ? session.roll_counter : 0;
-  const index = deterministicHash(`${sessionId}:${currentCounter}:${tier ?? 'any'}`) % filtered.length;
+  // Get or initialize roll counter for deterministic selection
+  const sheet = db.prepare('SELECT resources_json FROM character_sheets WHERE session_id = ?').get(sessionId);
+  const resources = parseJson(sheet?.resources_json, defaultResources());
+  const rollCounter = resources.__rollCounter || 0;
+
+  // Deterministic hash-based selection
+  const hash = createHash('sha256').update(sessionId + rollCounter).digest('hex');
+  const index = parseInt(hash.substring(0, 8), 16) % filtered.length;
   const pick = filtered[index];
-  db.prepare('UPDATE sessions SET roll_counter = ? WHERE session_id = ?').run(currentCounter + 1, sessionId);
+
+  // Increment and persist roll counter
+  resources.__rollCounter = rollCounter + 1;
+  db.prepare('UPDATE character_sheets SET resources_json = ? WHERE session_id = ?').run(
+    JSON.stringify(resources),
+    sessionId
+  );
 
   res.json({
     perk: {
@@ -306,7 +291,7 @@ app.post('/perk/roll', (req, res) => {
 });
 
 app.post('/perk/buy', (req, res) => {
-  const sessionId = requireSelectedSession(req, res);
+  const sessionId = requireSelectedSession(res, req.body?.sessionId);
   if (!sessionId) return;
   const { perkId } = req.body || {};
   if (typeof perkId !== 'string') return badRequest(res, 'perkId is required.');
@@ -349,12 +334,11 @@ app.get('/perk/:id', (req, res) => {
 });
 
 app.post('/xp/add', (req, res) => {
-  const sessionId = requireSelectedSession(req, res);
+  const sessionId = requireSelectedSession(res, req.body?.sessionId);
   if (!sessionId) return;
   const { perkId, amount } = req.body || {};
-  if (typeof perkId !== 'string' || !Number.isFinite(amount) || amount < 0) {
-    return badRequest(res, 'perkId and non-negative finite amount are required.');
-  }
+  if (typeof perkId !== 'string' || typeof amount !== 'number') return badRequest(res, 'perkId and numeric amount are required.');
+  if (!Number.isFinite(amount) || amount < 0) return badRequest(res, 'amount must be a finite non-negative number.');
 
   const owned = db.prepare('SELECT * FROM perk_instances WHERE session_id = ? AND perk_id = ?').get(sessionId, perkId);
   if (!owned) return res.status(404).json({ error: 'Perk instance not found.' });
@@ -370,12 +354,13 @@ app.post('/xp/add', (req, res) => {
 });
 
 app.post('/resource/modify', (req, res) => {
-  const sessionId = requireSelectedSession(req, res);
+  const sessionId = requireSelectedSession(res, req.body?.sessionId);
   if (!sessionId) return;
   const { resource, amount, reason } = req.body || {};
-  if (typeof resource !== 'string' || !Number.isFinite(amount) || amount < 0 || !Number.isInteger(amount)) {
-    return badRequest(res, 'resource and non-negative integer amount are required.');
+  if (typeof resource !== 'string' || typeof amount !== 'number') {
+    return badRequest(res, 'resource and numeric amount are required.');
   }
+  if (!Number.isFinite(amount)) return badRequest(res, 'amount must be a finite number.');
 
   const sheet = getSheet(sessionId);
   const oldValue = sheet.resources?.[resource]?.current || 0;
@@ -394,12 +379,13 @@ app.post('/resource/modify', (req, res) => {
 });
 
 app.post('/resource/set', (req, res) => {
-  const sessionId = requireSelectedSession(req, res);
+  const sessionId = requireSelectedSession(res, req.body?.sessionId);
   if (!sessionId) return;
   const { resource, value, reason } = req.body || {};
-  if (typeof resource !== 'string' || !Number.isFinite(value) || value < 0 || !Number.isInteger(value)) {
-    return badRequest(res, 'resource and non-negative integer value are required.');
+  if (typeof resource !== 'string' || typeof value !== 'number') {
+    return badRequest(res, 'resource and numeric value are required.');
   }
+  if (!Number.isFinite(value) || value < 0) return badRequest(res, 'value must be a finite non-negative number.');
 
   const sheet = getSheet(sessionId);
   const oldValue = sheet.resources?.[resource]?.current || 0;
@@ -420,13 +406,16 @@ app.post('/resource/set', (req, res) => {
 
 app.post('/perk/generate', (req, res) => {
   const { theme, tier, constellation } = req.body || {};
-  if (typeof theme !== 'string' || !Number.isFinite(tier) || !Number.isInteger(tier) || tier < 1 || typeof constellation !== 'string') {
-    return badRequest(res, 'theme, positive integer tier, and constellation are required.');
+  if (typeof theme !== 'string' || typeof tier !== 'number' || typeof constellation !== 'string') {
+    return badRequest(res, 'theme, tier, and constellation are required.');
+  }
+  if (!Number.isInteger(tier) || !Number.isFinite(tier) || tier <= 0) {
+    return badRequest(res, 'tier must be a positive integer.');
   }
 
-  const normalizedRaw = theme.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
-  const normalized = normalizedRaw || 'perk';
-  const id = `${normalized}_${randomUUID()}`;
+  const normalized = theme.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+  const base = normalized || 'perk';
+  const id = `${base}_${randomUUID()}`;
   const perk = {
     id,
     name: `${theme} Attunement`,
@@ -459,7 +448,7 @@ app.post('/perk/generate', (req, res) => {
 });
 
 app.post('/turn/finalize', (req, res) => {
-  const sessionId = requireSelectedSession(req, res);
+  const sessionId = requireSelectedSession(res, req.body?.sessionId);
   if (!sessionId) return;
 
   const sheet = getSheet(sessionId);
@@ -492,17 +481,11 @@ app.post('/turn/finalize', (req, res) => {
   }
 
   const xpGains = Array.isArray(req.body?.xpGains) ? req.body.xpGains : [];
-  const perkUpdates = [];
+  const xpUpdates = [];
+
   for (const gain of xpGains) {
-    if (
-      !gain ||
-      typeof gain.perkId !== 'string' ||
-      !Number.isFinite(gain.amount) ||
-      gain.amount < 0 ||
-      !Number.isInteger(gain.amount)
-    ) {
-      return badRequest(res, 'Each xpGain must include perkId and a non-negative integer amount.');
-    }
+    if (!gain || typeof gain.perkId !== 'string' || typeof gain.amount !== 'number') continue;
+    if (!Number.isFinite(gain.amount) || gain.amount < 0) continue;
     const ownedPerk = db
       .prepare('SELECT * FROM perk_instances WHERE session_id = ? AND perk_id = ?')
       .get(sessionId, gain.perkId);
@@ -510,8 +493,8 @@ app.post('/turn/finalize', (req, res) => {
     if (!ownedPerk || !def) continue;
 
     const result = applyXp({ scaling: parseJson(def.scaling_json, { type: 'none' }) }, { level: ownedPerk.level, xp: ownedPerk.xp }, gain.amount);
-    perkUpdates.push({ id: ownedPerk.id, level: result.level, xp: result.xp });
 
+    xpUpdates.push({ ownedPerkId: ownedPerk.id, level: result.level, xp: result.xp });
     updates.push(`+${gain.amount} XP (${def.name})`);
     for (const lvl of result.leveledTo) {
       updates.push(`${def.name} leveled up to ${lvl}`);
@@ -519,24 +502,30 @@ app.post('/turn/finalize', (req, res) => {
   }
 
   const newTurn = sheet.turn + 1;
+
+  // Execute all DB writes in a single transaction
   const tx = db.transaction(() => {
-    const updatePerk = db.prepare('UPDATE perk_instances SET level = ?, xp = ? WHERE id = ?');
-    for (const perkUpdate of perkUpdates) {
-      updatePerk.run(perkUpdate.level, perkUpdate.xp, perkUpdate.id);
+    // Update perk XP
+    const updatePerkStmt = db.prepare('UPDATE perk_instances SET level = ?, xp = ? WHERE id = ?');
+    for (const update of xpUpdates) {
+      updatePerkStmt.run(update.level, update.xp, update.ownedPerkId);
     }
+
+    // Update character sheet
     db.prepare('UPDATE character_sheets SET resources_json = ?, turn = ? WHERE session_id = ?').run(
       JSON.stringify(resources),
       newTurn,
       sessionId
     );
 
+    // Log the finalization
     appendLog(sessionId, 'turn_finalize', { turn: newTurn, updates });
   });
 
   try {
     tx();
   } catch (err) {
-    return res.status(500).json({ error: `Failed to finalize turn: ${err.message}` });
+    return badRequest(res, `Failed to finalize turn: ${err.message}`);
   }
 
   res.json({ turn: newTurn, updates });

@@ -39,4 +39,3 @@ Server starts on `http://localhost:3000`.
 - Mechanics are deterministic and resolved by the engine.
 - AI integration is represented as a validated `POST /perk/generate` flow in v1.
 - State is isolated per session; a selected session pointer is tracked in `app_state`.
-- Mutating endpoints require `sessionId` in the request body to avoid cross-session mutation.

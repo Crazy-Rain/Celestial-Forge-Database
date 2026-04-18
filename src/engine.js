@@ -40,20 +40,30 @@ function canLevel(perkDef, perkInstance) {
 }
 
 function applyXp(perkDef, perkInstance, addedXp) {
-  const safeAddedXp = Number.isFinite(addedXp) ? Math.max(0, addedXp) : 0;
-  let xpBase = Number.isFinite(perkInstance?.xp) ? perkInstance.xp : 0;
-  let level = Number.isFinite(perkInstance?.level) ? Math.trunc(perkInstance.level) : 0;
-  xpBase = Math.max(0, xpBase);
-  level = Math.max(0, level);
+  // Sanitize inputs: coerce to finite numbers
+  const sanitizedAddedXp = Number.isFinite(addedXp) && addedXp >= 0 ? addedXp : 0;
+  const sanitizedXp = Number.isFinite(perkInstance.xp) && perkInstance.xp >= 0 ? perkInstance.xp : 0;
+  const sanitizedLevel = Number.isInteger(perkInstance.level) && perkInstance.level >= 0 ? perkInstance.level : 0;
 
-  let xp = xpBase + safeAddedXp;
+  let xp = sanitizedXp + sanitizedAddedXp;
+  let level = sanitizedLevel;
   let leveledTo = [];
+
+  const maxIterations = 1000;
   let iterations = 0;
-  const maxIterations = 10000;
 
   while (canLevel(perkDef, { ...perkInstance, level }) && iterations < maxIterations) {
     const threshold = curveThreshold(level, perkDef.scaling?.xpCurve);
-    if (!Number.isFinite(threshold) || threshold <= 0 || xp < threshold) break;
+
+    // Safety check: ensure threshold is valid
+    if (!Number.isFinite(threshold) || threshold <= 0) {
+      break;
+    }
+
+    if (xp < threshold) {
+      break;
+    }
+
     xp -= threshold;
     level += 1;
     leveledTo.push(level);
